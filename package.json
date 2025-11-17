@@ -1,0 +1,20 @@
+{
+  "name": "reviews-coach-gemini-secure-proxy",
+  "version": "1.1.0",
+  "description": "Secure Fastify proxy for Google Gemini with JWT, extension-only CORS, model allowlist, rate limiting, and usage headers.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  },
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": {
+    "fastify": "4.29.1",
+    "@fastify/cors": "8.4.2",
+    "@fastify/helmet": "11.1.1",
+    "@fastify/rate-limit": "8.0.0",
+    "dotenv": "17.2.3",
+    "jose": "5.2.4"
+  }
+}
