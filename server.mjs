@@ -17,6 +17,8 @@ const JWT_TTL_SECONDS = parseInt(process.env.JWT_TTL_SECONDS || '600', 10);
 const RATE_LIMIT_PER_MINUTE = parseInt(process.env.RATE_LIMIT_PER_MINUTE || '60', 10);
 const BODY_LIMIT_BYTES = parseInt(process.env.BODY_LIMIT_BYTES || String(25 * 1024), 10);
 const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '15000', 10);
+const FREE_DAILY_LIMIT = Math.max(0, parseInt(process.env.FREE_DAILY_LIMIT || '5', 10));
+const UPGRADE_URL = (process.env.UPGRADE_URL || '').trim();
 
 const EXT_ORIGIN = EXTENSION_ID ? `chrome-extension://${EXTENSION_ID}` : null;
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || (EXT_ORIGIN || '*'))
@@ -28,6 +30,7 @@ const ALLOWED_IPS = (process.env.ALLOWED_IPS || '')
 const LICENSE_KEYS_SPEC = process.env.LICENSE_KEYS || '';
 const LICENSE_RECORDS = parseLicenseList(LICENSE_KEYS_SPEC);
 const HAS_LICENSES = LICENSE_RECORDS.length > 0;
+const usageCounters = new Map();
 
 if (!GEMINI_API_KEY) console.warn('[WARN] GEMINI_API_KEY is not set. Requests will fail.');
 if (!INTERNAL_AUTH_TOKEN) console.warn('[WARN] INTERNAL_AUTH_TOKEN is not set.');
@@ -172,6 +175,23 @@ function setUsageHeaders(reply, usage) {
   if (usage.reasoning !== undefined) reply.header('X-Token-Usage-Reasoning', String(usage.reasoning));
 }
 
+function getUsageBucket(key) {
+  if (!key) return null;
+  const today = new Date().toISOString().slice(0, 10);
+  let bucket = usageCounters.get(key);
+  if (!bucket || bucket.date !== today) {
+    bucket = { date: today, count: 0 };
+    usageCounters.set(key, bucket);
+  }
+  return bucket;
+}
+
+function quotaSnapshot(bucket) {
+  if (!bucket || !FREE_DAILY_LIMIT) return null;
+  const remaining = Math.max(0, FREE_DAILY_LIMIT - bucket.count);
+  return { limit: FREE_DAILY_LIMIT, remaining };
+}
+
 const unauthorized = (reply, msg='Unauthorized') => reply.code(401).send({ error: msg });
 const forbidden    = (reply, msg='Forbidden')    => reply.code(403).send({ error: msg });
 const badRequest   = (reply, msg='Bad Request')  => reply.code(400).send({ error: msg });
@@ -296,14 +316,44 @@ app.post('/api/extension/session', async (req, reply) => {
     : null;
   const nowMs = Date.now();
   const ttlSec = JWT_TTL_SECONDS;
+  const bucket = FREE_DAILY_LIMIT ? getUsageBucket(license.id) : null;
+  const quota = quotaSnapshot(bucket);
   const token = await signJwt({ extid: resolvedExt, scope: 'gen', license: license.id, install: installTag }, ttlSec);
 
   return reply.send({
     token,
     expiresIn: ttlSec,
     expiresAt: new Date(nowMs + ttlSec * 1000).toISOString(),
-    license: { id: license.id }
+    license: { id: license.id },
+    quota: quota ? { ...quota, upgradeUrl: UPGRADE_URL } : null
   });
+});
+
+// ===== Client log collector =====
+app.post('/api/extension/log', async (req, reply) => {
+  const auth = req.headers['authorization'];
+  if (!auth || !auth.startsWith('Bearer ')) return unauthorized(reply);
+  const token = auth.slice('Bearer '.length);
+  let payload;
+  try {
+    payload = await verifyJwt(token);
+  } catch (err) {
+    app.log.warn({ msg: 'Log endpoint token invalid', err: String(err) });
+    return unauthorized(reply, 'Invalid token');
+  }
+  const rawLevel = (req.body && req.body.level) ? String(req.body.level).toLowerCase() : 'info';
+  const allowed = new Set(['trace', 'debug', 'info', 'warn', 'error', 'fatal']);
+  const level = allowed.has(rawLevel) ? rawLevel : 'info';
+  const message = (req.body && req.body.message) ? String(req.body.message).slice(0, 400) : 'client-log';
+  const context = (req.body && typeof req.body.context === 'object') ? req.body.context : null;
+  app.log[level]({
+    msg: message,
+    source: 'extension',
+    license: payload.license,
+    install: payload.install,
+    context
+  });
+  return reply.send({ ok: true });
 });
 
 // ===== Proxy endpoint =====
@@ -319,9 +369,10 @@ app.post('/gemini/generate', async (req, reply) => {
   const token = auth.slice('Bearer '.length);
 
   // weryfikacja
+  let tokenPayload;
   try {
-    const payload = await verifyJwt(token);
-    if (EXTENSION_ID && payload.extid && payload.extid !== EXTENSION_ID) {
+    tokenPayload = await verifyJwt(token);
+    if (EXTENSION_ID && tokenPayload.extid && tokenPayload.extid !== EXTENSION_ID) {
       return unauthorized(reply, 'Token/ext mismatch');
     }
   } catch (e) {
@@ -337,6 +388,29 @@ app.post('/gemini/generate', async (req, reply) => {
   if (MODEL_ALLOWLIST.length && !MODEL_ALLOWLIST.includes(model)) {
     return forbidden(reply, 'Model not allowed');
   }
+
+  const licenseId = tokenPayload?.license || 'unknown';
+  const bucket = FREE_DAILY_LIMIT ? getUsageBucket(licenseId) : null;
+  if (bucket && FREE_DAILY_LIMIT && bucket.count >= FREE_DAILY_LIMIT) {
+    reply.header('X-Free-Limit', String(FREE_DAILY_LIMIT));
+    reply.header('X-Free-Remaining', '0');
+    return reply.code(402).send({
+      error: 'Limit darmowych odpowiedzi zostal wykorzystany.',
+      code: 'FREE_LIMIT_REACHED',
+      limit: FREE_DAILY_LIMIT,
+      remaining: 0,
+      upgradeUrl: UPGRADE_URL
+    });
+  }
+
+  const stampQuotaHeaders = (remainingOverride) => {
+    if (!FREE_DAILY_LIMIT || !bucket) return;
+    const remaining = (typeof remainingOverride === 'number')
+      ? Math.max(0, remainingOverride)
+      : Math.max(0, FREE_DAILY_LIMIT - bucket.count);
+    reply.header('X-Free-Limit', String(FREE_DAILY_LIMIT));
+    reply.header('X-Free-Remaining', String(remaining));
+  };
 
   // twardy timeout do upstream
   const controller = new AbortController();
@@ -355,10 +429,16 @@ app.post('/gemini/generate', async (req, reply) => {
     let parsed; try { parsed = JSON.parse(text); } catch { parsed = null; }
 
     if (res.ok) {
+      if (bucket && FREE_DAILY_LIMIT) {
+        bucket.count += 1;
+        const remaining = FREE_DAILY_LIMIT - bucket.count;
+        stampQuotaHeaders(remaining);
+      }
       const usage = usageFrom(parsed);
       if (usage) setUsageHeaders(reply, usage);
       return reply.code(200).type('application/json').send(parsed ?? text);
     } else {
+      stampQuotaHeaders();
       app.log.error({
         msg: 'Upstream Gemini error',
         status: res.status,
@@ -371,6 +451,7 @@ app.post('/gemini/generate', async (req, reply) => {
   } catch (err) {
     const isTimeout = err?.name === 'AbortError';
     app.log.error({ msg: 'Request to Gemini failed', error: String(err), promptPreview: maskContents(contents) });
+    stampQuotaHeaders();
     return reply.code(isTimeout ? 504 : 502).send({ error: isTimeout ? 'Upstream timeout' : 'Upstream failure' });
   } finally {
     clearTimeout(timeout);
