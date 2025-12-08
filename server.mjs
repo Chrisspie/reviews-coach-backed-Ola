@@ -4,7 +4,8 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import { SignJWT, jwtVerify } from 'jose';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import cookie from '@fastify/cookie';
+import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 
 // ===== Env & defaults =====
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -19,6 +20,22 @@ const BODY_LIMIT_BYTES = parseInt(process.env.BODY_LIMIT_BYTES || String(25 * 10
 const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '15000', 10);
 const FREE_DAILY_LIMIT = Math.max(0, parseInt(process.env.FREE_DAILY_LIMIT || '5', 10));
 const UPGRADE_URL = (process.env.UPGRADE_URL || '').trim();
+const GOOGLE_LOGIN_DEV_MODE = ((process.env.GOOGLE_LOGIN_DEV_MODE || '').toLowerCase() === 'true');
+const GOOGLE_LOGIN_DEV_DEFAULT_EMAIL = (process.env.GOOGLE_LOGIN_DEV_DEFAULT_EMAIL || '').trim();
+const WEB_SESSION_COOKIE_NAME = process.env.WEB_SESSION_COOKIE_NAME || 'rc_web_session';
+const WEB_SESSION_COOKIE_DOMAIN = process.env.WEB_SESSION_COOKIE_DOMAIN || undefined;
+const WEB_SESSION_COOKIE_SECURE = ((process.env.WEB_SESSION_COOKIE_SECURE || '').toLowerCase() === 'true');
+const WEB_SESSION_TTL_SECONDS = (() => {
+  const fallback = 60 * 60 * 24 * 7;
+  const parsed = parseInt(process.env.WEB_SESSION_TTL_SECONDS || String(fallback), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+})();
+const WEB_SESSION_COOKIE_SAME_SITE = (() => {
+  const raw = (process.env.WEB_SESSION_COOKIE_SAMESITE || (WEB_SESSION_COOKIE_SECURE ? 'none' : 'lax')).toLowerCase();
+  if (raw === 'lax' || raw === 'strict' || raw === 'none') return raw;
+  return WEB_SESSION_COOKIE_SECURE ? 'none' : 'lax';
+})();
+const WEB_SESSION_TTL_MS = WEB_SESSION_TTL_SECONDS * 1000;
 
 const EXT_ORIGIN = EXTENSION_ID ? `chrome-extension://${EXTENSION_ID}` : null;
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || (EXT_ORIGIN || '*'))
@@ -31,6 +48,8 @@ const LICENSE_KEYS_SPEC = process.env.LICENSE_KEYS || '';
 const LICENSE_RECORDS = parseLicenseList(LICENSE_KEYS_SPEC);
 const HAS_LICENSES = LICENSE_RECORDS.length > 0;
 const usageCounters = new Map();
+const googleUsers = new Map();
+const webSessions = new Map();
 
 if (!GEMINI_API_KEY) console.warn('[WARN] GEMINI_API_KEY is not set. Requests will fail.');
 if (!INTERNAL_AUTH_TOKEN) console.warn('[WARN] INTERNAL_AUTH_TOKEN is not set.');
@@ -66,6 +85,7 @@ await app.register(rateLimit, {
     'x-ratelimit-reset': true
   }
 });
+await app.register(cookie, { hook: 'onRequest' });
 
 // ===== Helpers =====
 const enc = new TextEncoder();
@@ -137,7 +157,7 @@ function maskContents(contents) {
     const firstText = contents?.[0]?.parts?.[0]?.text;
     if (typeof firstText !== 'string') return '[no-text]';
     const trimmed = firstText.slice(0, 120);
-    return `${trimmed}${firstText.length > 120 ? '…' : ''}`;
+    return `${trimmed}${firstText.length > 120 ? 'â€¦' : ''}`;
   } catch { return '[mask-error]'; }
 }
 
@@ -192,6 +212,97 @@ function quotaSnapshot(bucket) {
   return { limit: FREE_DAILY_LIMIT, remaining };
 }
 
+function ensureDevEmail(candidate) {
+  const raw = (candidate || '').toString().trim();
+  if (raw) return raw.toLowerCase();
+  if (GOOGLE_LOGIN_DEV_DEFAULT_EMAIL) return GOOGLE_LOGIN_DEV_DEFAULT_EMAIL.toLowerCase();
+  return 'tester@example.com';
+}
+
+function ensureGoogleUser(email) {
+  const key = email.toLowerCase();
+  let user = googleUsers.get(key);
+  if (!user) {
+    user = { id: key, email: key, plan: 'trial', createdAt: new Date().toISOString() };
+    googleUsers.set(key, user);
+  }
+  return user;
+}
+
+function currentQuotaForUser(user) {
+  if (!user || user.plan === 'pro') return null;
+  const bucket = FREE_DAILY_LIMIT ? getUsageBucket(user.id) : null;
+  const snapshot = quotaSnapshot(bucket);
+  return snapshot ? { ...snapshot, upgradeUrl: UPGRADE_URL } : null;
+}
+
+function accountPayloadForUser(user) {
+  if (!user) return { sub: null, email: null, plan: 'none', trial_remaining: null };
+  const quota = currentQuotaForUser(user);
+  return {
+    sub: user.id,
+    email: user.email,
+    plan: user.plan || 'trial',
+    trial_remaining: quota ? quota.remaining : null
+  };
+}
+
+function createWebSession(userId) {
+  if (!userId) throw new Error('Missing user id');
+  const id = randomUUID();
+  webSessions.set(id, { userId, expiresAt: Date.now() + WEB_SESSION_TTL_MS });
+  return id;
+}
+
+function getWebSession(sessionId) {
+  if (!sessionId) return null;
+  const state = webSessions.get(sessionId);
+  if (!state) return null;
+  if (state.expiresAt <= Date.now()) {
+    webSessions.delete(sessionId);
+    return null;
+  }
+  return state;
+}
+
+function refreshWebSession(sessionId) {
+  const state = webSessions.get(sessionId);
+  if (state) state.expiresAt = Date.now() + WEB_SESSION_TTL_MS;
+}
+
+function destroyWebSession(sessionId) {
+  if (!sessionId) return;
+  webSessions.delete(sessionId);
+}
+
+function setWebSessionCookie(reply, sessionId) {
+  const opts = {
+    httpOnly: true,
+    sameSite: WEB_SESSION_COOKIE_SAME_SITE,
+    path: '/',
+    secure: WEB_SESSION_COOKIE_SECURE,
+    maxAge: WEB_SESSION_TTL_SECONDS
+  };
+  if (WEB_SESSION_COOKIE_DOMAIN) opts.domain = WEB_SESSION_COOKIE_DOMAIN;
+  reply.setCookie(WEB_SESSION_COOKIE_NAME, sessionId, opts);
+}
+
+function clearWebSessionCookie(reply) {
+  const opts = { path: '/', sameSite: WEB_SESSION_COOKIE_SAME_SITE };
+  if (WEB_SESSION_COOKIE_DOMAIN) opts.domain = WEB_SESSION_COOKIE_DOMAIN;
+  reply.clearCookie(WEB_SESSION_COOKIE_NAME, opts);
+}
+
+function sessionFromRequest(req) {
+  if (!req || !req.cookies) return null;
+  const sessionId = req.cookies[WEB_SESSION_COOKIE_NAME];
+  if (!sessionId) return null;
+  const state = getWebSession(sessionId);
+  if (!state) return null;
+  refreshWebSession(sessionId);
+  return { id: sessionId, userId: state.userId };
+}
+
 const unauthorized = (reply, msg='Unauthorized') => reply.code(401).send({ error: msg });
 const forbidden    = (reply, msg='Forbidden')    => reply.code(403).send({ error: msg });
 const badRequest   = (reply, msg='Bad Request')  => reply.code(400).send({ error: msg });
@@ -230,7 +341,7 @@ app.get('/health', async () => ({ status: 'ok' }));
 
 // ===== Auth #1: nasz dotychczasowy endpoint (Bearer admin token) =====
 // Headers: Authorization: Bearer <INTERNAL_AUTH_TOKEN>
-// Optionally: X-Extension-Id: <EXTENSION_ID> (sprawdzamy zgodność gdy ustawiony EXTENSION_ID)
+// Optionally: X-Extension-Id: <EXTENSION_ID> (sprawdzamy zgodnoĹ›Ä‡ gdy ustawiony EXTENSION_ID)
 app.post('/auth/token', async (req, reply) => {
   const auth = req.headers['authorization'];
   if (!auth || !auth.startsWith('Bearer ')) return unauthorized(reply);
@@ -252,7 +363,7 @@ app.post('/auth/token', async (req, reply) => {
   return reply.send({ token: signed, expiresIn: JWT_TTL_SECONDS });
 });
 
-// ===== Auth #2: alias kompatybilny z obecną wtyczką (X-Internal-Auth) =====
+// ===== Auth #2: alias kompatybilny z obecnÄ… wtyczkÄ… (X-Internal-Auth) =====
 // Request:
 //   Header: X-Internal-Auth: <INTERNAL_AUTH_TOKEN>
 //   Body:   { extensionId, version }
@@ -279,7 +390,7 @@ app.post('/api/extension/jwt', async (req, reply) => {
   });
 });
 
-// ===== Auth #3: licencje użytkowników =====
+// ===== Auth #3: licencje uĹĽytkownikĂłw =====
 // Request body: { licenseKey: string, extensionId?: string, installId?: string }
 // Header: X-Extension-Id: <EXTENSION_ID>
 app.post('/api/extension/session', async (req, reply) => {
@@ -327,6 +438,85 @@ app.post('/api/extension/session', async (req, reply) => {
     license: { id: license.id },
     quota: quota ? { ...quota, upgradeUrl: UPGRADE_URL } : null
   });
+});
+
+app.post('/api/extension/google-session', async (req, reply) => {
+  if (!GOOGLE_LOGIN_DEV_MODE) {
+    app.log.warn({ msg: 'Google session requested but GOOGLE_LOGIN_DEV_MODE=false' });
+    return reply.code(503).send({ error: 'Google login not configured' });
+  }
+  const { accessToken, extensionId, installId } = req.body || {};
+  const extFromBody = typeof extensionId === 'string' && extensionId.trim() ? extensionId.trim() : null;
+  const headerExt = typeof req.headers['x-extension-id'] === 'string' ? req.headers['x-extension-id'] : null;
+  if (EXTENSION_ID) {
+    if (headerExt && headerExt !== EXTENSION_ID) {
+      return unauthorized(reply, 'Invalid extension id');
+    }
+    if (extFromBody && extFromBody !== EXTENSION_ID) {
+      return unauthorized(reply, 'Invalid extension id');
+    }
+  }
+  const resolvedExt = EXTENSION_ID || extFromBody || headerExt || null;
+  const email = ensureDevEmail(accessToken);
+  const profile = ensureGoogleUser(email);
+  const installTag = typeof installId === 'string' && installId.trim()
+    ? installId.trim().slice(0, 64)
+    : null;
+  const ttlSec = JWT_TTL_SECONDS;
+  const nowMs = Date.now();
+  const quota = currentQuotaForUser(profile);
+  const token = await signJwt({ extid: resolvedExt, scope: 'gen', license: profile.id, install: installTag, user: profile.id }, ttlSec);
+  return reply.send({
+    token,
+    expiresIn: ttlSec,
+    expiresAt: new Date(nowMs + ttlSec * 1000).toISOString(),
+    profile: { email: profile.email, sub: profile.id },
+    quota
+  });
+});
+
+app.post('/api/web/google-login', async (req, reply) => {
+  if (!GOOGLE_LOGIN_DEV_MODE) {
+    return reply.code(503).send({ error: 'Google login not configured' });
+  }
+  const rawToken = req.body && typeof req.body.id_token === 'string' ? req.body.id_token.trim() : '';
+  const email = ensureDevEmail(rawToken);
+  const user = ensureGoogleUser(email);
+  const sessionId = createWebSession(user.id);
+  setWebSessionCookie(reply, sessionId);
+  reply.header('Cache-Control', 'no-store');
+  return reply.send(accountPayloadForUser(user));
+});
+
+app.get('/api/web/account/status', async (req, reply) => {
+  reply.header('Cache-Control', 'no-store');
+  const session = sessionFromRequest(req);
+  if (!session) {
+    return reply.send(accountPayloadForUser(null));
+  }
+  const user = googleUsers.get(session.userId);
+  if (!user) {
+    destroyWebSession(session.id);
+    clearWebSessionCookie(reply);
+    return reply.send(accountPayloadForUser(null));
+  }
+  return reply.send(accountPayloadForUser(user));
+});
+
+app.post('/api/web/account/upgrade', async (req, reply) => {
+  const session = sessionFromRequest(req);
+  if (!session) {
+    return unauthorized(reply, 'Not authenticated');
+  }
+  const user = googleUsers.get(session.userId);
+  if (!user) {
+    destroyWebSession(session.id);
+    clearWebSessionCookie(reply);
+    return unauthorized(reply, 'Not authenticated');
+  }
+  user.plan = 'pro';
+  const redirect = UPGRADE_URL || 'https://example.com/upgrade';
+  return reply.send({ checkout_url: redirect, provider: GOOGLE_LOGIN_DEV_MODE ? 'dev' : 'manual' });
 });
 
 // ===== Client log collector =====
@@ -389,18 +579,21 @@ app.post('/gemini/generate', async (req, reply) => {
     return forbidden(reply, 'Model not allowed');
   }
 
-  const licenseId = tokenPayload?.license || 'unknown';
+  const licenseId = tokenPayload?.user || tokenPayload?.license || 'dev-user';
   const bucket = FREE_DAILY_LIMIT ? getUsageBucket(licenseId) : null;
-  if (bucket && FREE_DAILY_LIMIT && bucket.count >= FREE_DAILY_LIMIT) {
+  const rejectQuotaResponse = (message, remainingOverride) => {
     reply.header('X-Free-Limit', String(FREE_DAILY_LIMIT));
-    reply.header('X-Free-Remaining', '0');
+    reply.header('X-Free-Remaining', String(Math.max(0, remainingOverride ?? 0)));
     return reply.code(402).send({
-      error: 'Limit darmowych odpowiedzi zostal wykorzystany.',
+      error: message,
       code: 'FREE_LIMIT_REACHED',
       limit: FREE_DAILY_LIMIT,
-      remaining: 0,
+      remaining: Math.max(0, remainingOverride ?? 0),
       upgradeUrl: UPGRADE_URL
     });
+  };
+  if (bucket && FREE_DAILY_LIMIT && bucket.count >= FREE_DAILY_LIMIT) {
+    return rejectQuotaResponse('Limit darmowych wygenerowań został wykorzystany.', 0);
   }
 
   const stampQuotaHeaders = (remainingOverride) => {
@@ -431,13 +624,26 @@ app.post('/gemini/generate', async (req, reply) => {
     if (res.ok) {
       if (bucket && FREE_DAILY_LIMIT) {
         bucket.count += 1;
-        const remaining = FREE_DAILY_LIMIT - bucket.count;
+        const remaining = Math.max(0, FREE_DAILY_LIMIT - bucket.count);
         stampQuotaHeaders(remaining);
+        reply.header('X-Free-Message', remaining > 0 ? `Pozostało ${remaining} z ${FREE_DAILY_LIMIT} darmowych odpowiedzi.` : 'Limit darmowych wygenerowań został wykorzystany.');
       }
       const usage = usageFrom(parsed);
       if (usage) setUsageHeaders(reply, usage);
       return reply.code(200).type('application/json').send(parsed ?? text);
     } else {
+      if (res.status === 429) {
+        const quotaPayload = quotaSnapshot(bucket) || { limit: FREE_DAILY_LIMIT || 0, remaining: 0, upgradeUrl: UPGRADE_URL };
+        reply.header('X-Free-Limit', String(quotaPayload.limit ?? FREE_DAILY_LIMIT ?? 0));
+        reply.header('X-Free-Remaining', '0');
+        return reply.code(402).send({
+          error: 'Limit darmowych odpowiedzi został wykorzystany.',
+          code: 'FREE_LIMIT_REACHED',
+          limit: quotaPayload.limit ?? FREE_DAILY_LIMIT ?? 0,
+          remaining: 0,
+          upgradeUrl: quotaPayload.upgradeUrl ?? UPGRADE_URL
+        });
+      }
       stampQuotaHeaders();
       app.log.error({
         msg: 'Upstream Gemini error',
