@@ -5,6 +5,7 @@ import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import { SignJWT, jwtVerify } from 'jose';
 import cookie from '@fastify/cookie';
+import fastifyRawBody from 'fastify-raw-body';
 import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 
 // ===== Env & defaults =====
@@ -20,6 +21,21 @@ const BODY_LIMIT_BYTES = parseInt(process.env.BODY_LIMIT_BYTES || String(25 * 10
 const GEMINI_TIMEOUT_MS = parseInt(process.env.GEMINI_TIMEOUT_MS || '15000', 10);
 const FREE_DAILY_LIMIT = Math.max(0, parseInt(process.env.FREE_DAILY_LIMIT || '5', 10));
 const UPGRADE_URL = (process.env.UPGRADE_URL || '').trim();
+const PAYU_DEV_MODE = ((process.env.PAYU_DEV_MODE || '').toLowerCase() === 'true');
+const PAYU_POS_ID = (process.env.PAYU_POS_ID || '').trim();
+const PAYU_CLIENT_ID = (process.env.PAYU_CLIENT_ID || '').trim();
+const PAYU_CLIENT_SECRET = (process.env.PAYU_CLIENT_SECRET || '').trim();
+const PAYU_SECOND_KEY = (process.env.PAYU_SECOND_KEY || '').trim();
+const PAYU_NOTIFY_URL = (process.env.PAYU_NOTIFY_URL || '').trim();
+const PAYU_CONTINUE_URL = (process.env.PAYU_CONTINUE_URL || UPGRADE_URL || '').trim();
+const PAYU_MOCK_PAYMENT_URL = (process.env.PAYU_MOCK_PAYMENT_URL || 'https://payu.example.com/mock-checkout').trim();
+const PAYU_CURRENCY = (process.env.PAYU_CURRENCY || 'PLN').trim().toUpperCase() || 'PLN';
+const PAYU_API_BASE_URL = (process.env.PAYU_API_BASE_URL || 'https://secure.snd.payu.com').replace(/\/+$/, '');
+const PAYU_AMOUNT_PRO = (process.env.PAYU_AMOUNT_PRO || '9900').trim();
+const PAYU_PLAN_DURATION_DAYS = Math.max(1, parseInt(process.env.PAYU_PLAN_DURATION_DAYS || '30', 10));
+const PAYU_ENABLED = Boolean(PAYU_POS_ID && PAYU_CLIENT_ID && PAYU_CLIENT_SECRET && PAYU_SECOND_KEY && PAYU_NOTIFY_URL && PAYU_CONTINUE_URL && PAYU_AMOUNT_PRO);
+const payuTokenCache = { token: '', expiresAt: 0 };
+const payuOrderMap = new Map();
 const GOOGLE_LOGIN_DEV_MODE = ((process.env.GOOGLE_LOGIN_DEV_MODE || '').toLowerCase() === 'true');
 const GOOGLE_LOGIN_DEV_DEFAULT_EMAIL = (process.env.GOOGLE_LOGIN_DEV_DEFAULT_EMAIL || '').trim();
 const WEB_SESSION_COOKIE_NAME = process.env.WEB_SESSION_COOKIE_NAME || 'rc_web_session';
@@ -86,6 +102,7 @@ await app.register(rateLimit, {
   }
 });
 await app.register(cookie, { hook: 'onRequest' });
+await app.register(fastifyRawBody, { field: 'rawBody', global: false, runFirst: true, encoding: false });
 
 // ===== Helpers =====
 const enc = new TextEncoder();
@@ -303,6 +320,135 @@ function sessionFromRequest(req) {
   return { id: sessionId, userId: state.userId };
 }
 
+function payuPlanMeta(planId) {
+  const amount = PAYU_AMOUNT_PRO;
+  if (!amount) return null;
+  const durationMs = PAYU_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000;
+  return { amount, durationMs, description: 'Reviews Coach PRO' };
+}
+
+function buildPayuExtOrderId(userId, planId) {
+  const encoded = Buffer.from(userId || 'anon').toString('base64url');
+  return `rc|${encoded}|${planId}|${Date.now()}`;
+}
+
+function parsePayuExtOrderId(extOrderId) {
+  const parts = typeof extOrderId === 'string' ? extOrderId.split('|') : [];
+  if (parts.length < 4 || parts[0] !== 'rc') return { userId: null, planId: null };
+  let decoded = null;
+  try {
+    decoded = Buffer.from(parts[1], 'base64url').toString('utf8');
+  } catch (_err) {
+    decoded = null;
+  }
+  return { userId: decoded, planId: parts[2] };
+}
+
+function rememberPayuOrder(extOrderId, meta) {
+  if (!extOrderId) return;
+  payuOrderMap.set(extOrderId, { ...meta, createdAt: Date.now() });
+}
+
+function consumePayuOrder(extOrderId) {
+  if (!extOrderId) return null;
+  const meta = payuOrderMap.get(extOrderId) || null;
+  payuOrderMap.delete(extOrderId);
+  return meta;
+}
+
+async function ensurePayuAccessToken() {
+  if (!PAYU_ENABLED) throw new Error('PayU is not configured');
+  if (payuTokenCache.token && Date.now() < payuTokenCache.expiresAt - 5000) {
+    return payuTokenCache.token;
+  }
+  const params = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: PAYU_CLIENT_ID,
+    client_secret: PAYU_CLIENT_SECRET
+  });
+  const resp = await fetch(`${PAYU_API_BASE_URL}/pl/standard/user/oauth/authorize`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params.toString()
+  });
+  if (!resp.ok) {
+    throw new Error(`PayU auth failed ${resp.status}`);
+  }
+  const data = await resp.json();
+  const token = (data.access_token || '').trim();
+  if (!token) throw new Error('PayU auth returned empty token');
+  const expiresIn = Number(data.expires_in || data.expires || 3600);
+  payuTokenCache.token = token;
+  payuTokenCache.expiresAt = Date.now() + Math.max(0, expiresIn - 10) * 1000;
+  return token;
+}
+
+async function createPayuOrderForPlan(user, planId, customerIp) {
+  if (!PAYU_ENABLED) throw new Error('PayU is not configured');
+  const meta = payuPlanMeta(planId);
+  if (!meta) throw new Error('Unsupported plan_id');
+  const token = await ensurePayuAccessToken();
+  const extOrderId = buildPayuExtOrderId(user.id, planId);
+  const payload = {
+    notifyUrl: PAYU_NOTIFY_URL,
+    continueUrl: PAYU_CONTINUE_URL || UPGRADE_URL || 'https://example.com',
+    customerIp: customerIp || '127.0.0.1',
+    merchantPosId: PAYU_POS_ID || '0',
+    description: meta.description,
+    currencyCode: PAYU_CURRENCY,
+    totalAmount: meta.amount,
+    extOrderId,
+    buyer: {
+      email: user.email || 'customer@example.com',
+      language: 'pl'
+    },
+    products: [
+      { name: meta.description, unitPrice: meta.amount, quantity: '1' }
+    ]
+  };
+  const resp = await fetch(`${PAYU_API_BASE_URL}/api/v2_1/orders`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`
+    },
+    body: JSON.stringify(payload)
+  });
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok || data?.status?.statusCode !== 'SUCCESS') {
+    throw new Error(data?.status?.statusDesc || `PayU order failed ${resp.status}`);
+  }
+  const redirectUri = data?.redirectUri || (Array.isArray(data?.properties)
+    ? (data.properties.find(p => p.name === 'PAYMENT_URL')?.value || null)
+    : null);
+  if (!redirectUri) throw new Error('PayU order missing redirect URL');
+  rememberPayuOrder(extOrderId, { userId: user.id, planId, durationMs: meta.durationMs });
+  return { redirectUri, extOrderId };
+}
+
+function payuSignatureValid(rawBody, header) {
+  if (!PAYU_ENABLED || !PAYU_SECOND_KEY) return false;
+  if (!rawBody || !header) return false;
+  const parts = Object.create(null);
+  header.split(';').forEach(fragment => {
+    const [key, value] = fragment.split('=');
+    if (key && value) parts[key.trim().toLowerCase()] = value.trim();
+  });
+  const provided = (parts.signature || '').toLowerCase();
+  const algorithm = (parts.algorithm || '').toLowerCase();
+  if (!provided || algorithm !== 'md5') return false;
+  const expected = createHash('md5').update(String(rawBody) + PAYU_SECOND_KEY).digest('hex');
+  return provided.length === expected.length && timingSafeEqual(Buffer.from(expected, 'utf8'), Buffer.from(provided, 'utf8'));
+}
+
+async function applyPaidPlan(user, planId, durationMs) {
+  if (!user) return;
+  user.plan = 'pro';
+  if (durationMs) {
+    user.planExpiresAt = new Date(Date.now() + durationMs).toISOString();
+  }
+}
+
 const unauthorized = (reply, msg='Unauthorized') => reply.code(401).send({ error: msg });
 const forbidden    = (reply, msg='Forbidden')    => reply.code(403).send({ error: msg });
 const badRequest   = (reply, msg='Bad Request')  => reply.code(400).send({ error: msg });
@@ -514,9 +660,62 @@ app.post('/api/web/account/upgrade', async (req, reply) => {
     clearWebSessionCookie(reply);
     return unauthorized(reply, 'Not authenticated');
   }
-  user.plan = 'pro';
+  const rawPlanId = req.body && typeof req.body.plan_id === 'string' ? req.body.plan_id.trim() : 'pro';
+  if (PAYU_DEV_MODE) {
+    await applyPaidPlan(user, rawPlanId, PAYU_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000);
+    const checkout = PAYU_MOCK_PAYMENT_URL || PAYU_CONTINUE_URL || UPGRADE_URL || 'https://payu.example.com/mock';
+    return reply.send({ checkout_url: checkout, provider: 'payu', mock: true });
+  }
+  if (PAYU_ENABLED) {
+    try {
+      const order = await createPayuOrderForPlan(user, rawPlanId, clientIp(req));
+      return reply.send({ checkout_url: order.redirectUri, provider: 'payu', order_id: order.extOrderId });
+    } catch (err) {
+      app.log.error({ msg: 'PayU order failed', err: err?.message || err, plan: rawPlanId });
+    }
+  }
+  await applyPaidPlan(user, rawPlanId, PAYU_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000);
   const redirect = UPGRADE_URL || 'https://example.com/upgrade';
   return reply.send({ checkout_url: redirect, provider: GOOGLE_LOGIN_DEV_MODE ? 'dev' : 'manual' });
+});
+
+app.post('/api/billing/payu-webhook', { config: { rawBody: true } }, async (req, reply) => {
+  if (!PAYU_ENABLED) {
+    app.log.warn({ msg: 'PayU webhook invoked but not configured' });
+    return reply.code(503).send({ error: 'PayU not configured' });
+  }
+  const signatureHeader = req.headers['openpayu-signature'];
+  const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+  const rawBody = req.rawBody ? req.rawBody.toString('utf8') : (req.body ? JSON.stringify(req.body) : '');
+  if (!payuSignatureValid(rawBody, signature)) {
+    app.log.warn({ msg: 'PayU webhook signature invalid' });
+    return reply.code(400).send({ error: 'Invalid signature' });
+  }
+  let payload;
+  try {
+    payload = rawBody ? JSON.parse(rawBody) : req.body || {};
+  } catch (err) {
+    return reply.code(400).send({ error: 'Invalid JSON' });
+  }
+  const order = payload?.order || (Array.isArray(payload?.orders) ? payload.orders[0] : null);
+  if (!order) {
+    return reply.code(400).send({ error: 'Missing order payload' });
+  }
+  const extOrderId = order.extOrderId || order.orderId || order?.order?.extOrderId || null;
+  const status = (order.status || order.statusCode || '').toString().toUpperCase();
+  if (!extOrderId) {
+    return reply.code(400).send({ error: 'Missing extOrderId' });
+  }
+  if (status === 'COMPLETED' || status === 'SUCCESS') {
+    const pending = consumePayuOrder(extOrderId) || parsePayuExtOrderId(extOrderId);
+    const user = pending?.userId ? googleUsers.get(pending.userId) : null;
+    if (user) {
+      await applyPaidPlan(user, pending.planId || 'pro', pending.durationMs || (PAYU_PLAN_DURATION_DAYS * 24 * 60 * 60 * 1000));
+    } else {
+      app.log.warn({ msg: 'PayU webhook references unknown user', extOrderId, pending });
+    }
+  }
+  return reply.send({ received: true });
 });
 
 // ===== Client log collector =====
