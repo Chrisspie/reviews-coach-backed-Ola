@@ -825,7 +825,10 @@ app.post('/gemini/generate', async (req, reply) => {
         bucket.count += 1;
         const remaining = Math.max(0, FREE_DAILY_LIMIT - bucket.count);
         stampQuotaHeaders(remaining);
-        reply.header('X-Free-Message', remaining > 0 ? `Pozostało ${remaining} z ${FREE_DAILY_LIMIT} darmowych odpowiedzi.` : 'Limit darmowych wygenerowań został wykorzystany.');
+        const freeMessage = remaining > 0
+          ? `Remaining ${remaining} of ${FREE_DAILY_LIMIT} free responses.`
+          : 'Free response limit reached.';
+        reply.header('X-Free-Message', freeMessage);
       }
       const usage = usageFrom(parsed);
       if (usage) setUsageHeaders(reply, usage);
@@ -864,6 +867,10 @@ app.post('/gemini/generate', async (req, reply) => {
 });
 
 // ===== Start =====
-app.listen({ port: PORT, host: '0.0.0.0' })
-  .then(addr => app.log.info(`Server listening on ${addr}`))
-  .catch(err => { app.log.error(err); process.exit(1); });
+export { app };
+
+if (process.env.NODE_ENV !== 'test') {
+  app.listen({ port: PORT, host: '0.0.0.0' })
+    .then(addr => app.log.info(`Server listening on ${addr}`))
+    .catch(err => { app.log.error(err); process.exit(1); });
+}
