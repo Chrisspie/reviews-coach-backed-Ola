@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-import { createLicenseVerifier, constantTimeCompare } from '../lib/licenses.mjs';
-import { getUsageBucket, quotaSnapshot } from '../lib/quota.mjs';
-import { maskContents, usageFrom, setUsageHeaders } from '../lib/gemini.mjs';
-import { clientIp } from '../lib/request.mjs';
-import { sha256Buffer } from '../config.mjs';
+import { createLicenseVerifier, constantTimeCompare } from '../lib/licenses.js';
+import { getUsageBucket, quotaSnapshot } from '../lib/quota.js';
+import { maskContents, usageFrom, setUsageHeaders } from '../lib/gemini.js';
+import { clientIp } from '../lib/request.js';
+import { sha256Buffer } from '../config.js';
 
 afterEach(() => {
   vi.useRealTimers();

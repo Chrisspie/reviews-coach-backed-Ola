@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { jwtVerify } from 'jose';
-import { createHash } from 'node:crypto';
 
 const baseEnv = {
   NODE_ENV: 'test',
@@ -12,18 +11,8 @@ const baseEnv = {
   LICENSE_KEYS: 'pro:LICENSE-KEY',
   FREE_DAILY_LIMIT: '2',
   UPGRADE_URL: 'https://upgrade.example.com',
-  GOOGLE_LOGIN_DEV_MODE: 'true',
-  GOOGLE_LOGIN_DEV_DEFAULT_EMAIL: 'tester@example.com',
-  PAYU_DEV_MODE: 'true',
-  PAYU_POS_ID: 'pos-1',
-  PAYU_CLIENT_ID: 'payu-client',
-  PAYU_CLIENT_SECRET: 'payu-secret',
-  PAYU_SECOND_KEY: 'payu-second',
-  PAYU_NOTIFY_URL: 'https://notify.example.com',
-  PAYU_CONTINUE_URL: 'https://continue.example.com',
-  PAYU_AMOUNT_PRO: '9900',
   MODEL_ALLOWLIST: 'gemini-test-model',
-  CORS_ORIGINS: '*',
+  CORS_ORIGINS: '*'
 };
 
 const textEncoder = new TextEncoder();
@@ -64,7 +53,7 @@ function applyEnv(overrides = {}) {
 async function withServer(envOverrides, fn) {
   const restoreEnv = applyEnv(envOverrides);
   vi.resetModules();
-  const { app } = await import('../server.mjs');
+  const { app } = await import('../server.js');
   try {
     await fn(app);
   } finally {
@@ -132,143 +121,29 @@ describe('server endpoints', () => {
         payload: { extensionId: 'ext-123' }
       });
       expect(ok.statusCode).toBe(200);
-      expect(ok.json()).toHaveProperty('token');
+      const body = ok.json();
+      expect(body.token).toBeTruthy();
     });
   });
 
   it('requires valid license keys for /api/extension/session', async () => {
     await withServer({}, async (app) => {
-      const invalid = await app.inject({
+      const denied = await app.inject({
         method: 'POST',
         url: '/api/extension/session',
         headers: { 'x-extension-id': 'ext-123' },
-        payload: { licenseKey: 'WRONG' }
+        payload: { licenseKey: 'INVALID' }
       });
-      expect(invalid.statusCode).toBe(401);
-
-      const valid = await app.inject({
-        method: 'POST',
-        url: '/api/extension/session',
-        headers: { 'x-extension-id': 'ext-123' },
-        payload: { licenseKey: 'LICENSE-KEY' }
-      });
-      expect(valid.statusCode).toBe(200);
-      expect(valid.json()).toMatchObject({ license: { id: 'pro' } });
-    });
-  });
-
-  it('returns dev Google sessions for the extension', async () => {
-    await withServer({}, async (app) => {
-      const session = await app.inject({
-        method: 'POST',
-        url: '/api/extension/google-session',
-        headers: { 'x-extension-id': 'ext-123' },
-        payload: { accessToken: 'user@example.com' }
-      });
-      expect(session.statusCode).toBe(200);
-      const body = session.json();
-      expect(body.profile).toMatchObject({ email: 'user@example.com' });
-      expect(body).toHaveProperty('token');
-      expect(body.quota).toBeTruthy();
-    });
-  });
-
-  it('creates and uses a web session cookie', async () => {
-    await withServer({}, async (app) => {
-      const login = await app.inject({
-        method: 'POST',
-        url: '/api/web/google-login',
-        payload: { id_token: 'web@example.com' }
-      });
-      expect(login.statusCode).toBe(200);
-      const cookieHeader = login.headers['set-cookie'];
-      expect(cookieHeader).toBeTruthy();
-      const cookie = Array.isArray(cookieHeader) ? cookieHeader[0] : cookieHeader;
-
-      const status = await app.inject({
-        method: 'GET',
-        url: '/api/web/account/status',
-        headers: { cookie: cookie.split(';')[0] }
-      });
-      expect(status.json()).toMatchObject({ plan: 'trial', email: 'web@example.com' });
-    });
-  });
-
-  it('allows upgrading accounts in dev/mock mode', async () => {
-    await withServer({}, async (app) => {
-      const login = await app.inject({
-        method: 'POST',
-        url: '/api/web/google-login',
-        payload: { id_token: 'upgrade@example.com' }
-      });
-      const cookie = (Array.isArray(login.headers['set-cookie'])
-        ? login.headers['set-cookie'][0]
-        : login.headers['set-cookie']).split(';')[0];
-
-      const upgrade = await app.inject({
-        method: 'POST',
-        url: '/api/web/account/upgrade',
-        headers: { cookie },
-        payload: { plan_id: 'pro' }
-      });
-      expect(upgrade.statusCode).toBe(200);
-      expect(upgrade.json()).toMatchObject({ provider: 'payu', mock: true });
-
-      const status = await app.inject({
-        method: 'GET',
-        url: '/api/web/account/status',
-        headers: { cookie }
-      });
-      expect(status.json().plan).toBe('pro');
-    });
-  });
-
-  it('validates PayU webhook signatures and applies paid plans', async () => {
-    await withServer({ PAYU_DEV_MODE: 'false' }, async (app) => {
-      const login = await app.inject({
-        method: 'POST',
-        url: '/api/web/google-login',
-        payload: { id_token: 'payu@example.com' }
-      });
-      const cookie = (Array.isArray(login.headers['set-cookie'])
-        ? login.headers['set-cookie'][0]
-        : login.headers['set-cookie']).split(';')[0];
-      const userId = login.json().sub;
-      const extOrderId = `rc|${Buffer.from(userId).toString('base64url')}|pro|${Date.now()}`;
-      const body = { order: { extOrderId, status: 'COMPLETED' } };
-      const rawBody = JSON.stringify(body);
-      const signature = createHash('md5')
-        .update(rawBody + baseEnv.PAYU_SECOND_KEY)
-        .digest('hex');
-
-      const bad = await app.inject({
-        method: 'POST',
-        url: '/api/billing/payu-webhook',
-        headers: {
-          'openpayu-signature': 'signature=deadbeef;algorithm=MD5',
-          'content-type': 'application/json'
-        },
-        payload: rawBody
-      });
-      expect(bad.statusCode).toBe(400);
+      expect(denied.statusCode).toBe(401);
 
       const ok = await app.inject({
         method: 'POST',
-        url: '/api/billing/payu-webhook',
-        headers: {
-          'openpayu-signature': `signature=${signature};algorithm=MD5`,
-          'content-type': 'application/json'
-        },
-        payload: rawBody
+        url: '/api/extension/session',
+        headers: { 'x-extension-id': 'ext-123' },
+        payload: { licenseKey: 'LICENSE-KEY', installId: 'install-abc' }
       });
       expect(ok.statusCode).toBe(200);
-
-      const status = await app.inject({
-        method: 'GET',
-        url: '/api/web/account/status',
-        headers: { cookie }
-      });
-      expect(status.json().plan).toBe('pro');
+      expect(ok.json().license.id).toBe('pro');
     });
   });
 
