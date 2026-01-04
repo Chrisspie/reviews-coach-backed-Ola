@@ -15,8 +15,12 @@ function resolvePort(defaultPort) {
   return Number.isFinite(parsed) ? parsed : defaultPort;
 }
 
+console.log("Server.js executing");
+console.log("nodeEnv:", process.env.NODE_ENV);
+
 if (process.env.NODE_ENV !== 'test') {
   const port = resolvePort(resolvedConfig.PORT ?? 3000);
+  console.log("Started on port: ", port);
   app.listen({ port, host: '0.0.0.0' })
     .then((addr) => app.log.info(`Server listening on ${addr}`))
     .catch((err) => {
