@@ -8,11 +8,20 @@ const app = await createApp(resolvedConfig);
 
 export { app, createApp, resolvedConfig as config };
 
+function resolvePort(defaultPort) {
+  const envValue = process.env.PORT;
+  if (!envValue) return defaultPort;
+  const parsed = Number.parseInt(envValue, 10);
+  return Number.isFinite(parsed) ? parsed : defaultPort;
+}
+
 if (process.env.NODE_ENV !== 'test') {
-  app.listen({ port: resolvedConfig.PORT, host: '0.0.0.0' })
+  const port = resolvePort(resolvedConfig.PORT ?? 3000);
+  app.listen({ port, host: '0.0.0.0' })
     .then((addr) => app.log.info(`Server listening on ${addr}`))
     .catch((err) => {
       app.log.error(err);
       process.exit(1);
     });
 }
+
