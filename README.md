@@ -1,12 +1,12 @@
-# Reviews Coach â€“ Gemini **Secure** Proxy (Node 20+)
+# Reviews Coach - Gemini Secure Proxy (Node 20+)
 
 Hardened Fastify proxy for Google Gemini `generateContent` that adds:
 
-- **JWT shortâ€‘lived tokens** (`/auth/token`, HS256) â€“ default **10 min**
-- **Extensionâ€‘only CORS** (`chrome-extension://<EXTENSION_ID>`) + header check `X-Extension-Id`
+- **JWT short-lived tokens** (`/auth/token`, HS256) – default **10 min**
+- **Extension-only CORS** (`chrome-extension://<EXTENSION_ID>`) + `X-Extension-Id` header check
 - **Model allowlist** (`MODEL_ALLOWLIST`)
-- **Rate limit** (@fastify/rate-limit) â€“ default **60 req/min/IP**
-- **Body size limit** (25KB by default)
+- **Rate limit** (@fastify/rate-limit) – default **60 req/min/IP**
+- **Body size limit** (25KB default)
 - **Security headers** (@fastify/helmet) + `Cache-Control: no-store`
 - **Token usage** response headers
 - Optional **IP allowlist**
@@ -18,34 +18,46 @@ Hardened Fastify proxy for Google Gemini `generateContent` that adds:
 ## 1) Quick start
 
 ```bash
-npm i
+npm install
 # Linux/macOS
-export GEMINI_API_KEY=...
-export INTERNAL_AUTH_TOKEN='set-a-long-random-admin-token'
-export AUTH_SECRET='set-a-very-long-random-secret-at-least-32-chars'
-export EXTENSION_ID='abcdefghijklmnopabcdefghijklmnop'
-export CORS_ORIGINS='chrome-extension://abcdefghijklmnopabcdefghijklmnop'
-export LICENSE_KEYS='client-a:PAID-LICENSE-1,client-b:ANOTHER-LICENSE'
-npm run dev
+env GEMINI_API_KEY=... \
+    INTERNAL_AUTH_TOKEN='set-a-long-random-admin-token' \
+    AUTH_SECRET='set-a-very-long-random-secret-at-least-32-chars' \
+    EXTENSION_ID='abcdefghijklmnopabcdefghijklmnop' \
+    CORS_ORIGINS='chrome-extension://abcdefghijklmnopabcdefghijklmnop' \
+    LICENSE_KEYS='client-a:PAID-LICENSE-1,client-b:ANOTHER-LICENSE' \
+    npm run dev
 ```
 
 Health:
+
 ```bash
 curl http://localhost:3000/health
 ```
 
 ### 1.1) Get short-lived JWT
+
 ```bash
-curl -X POST http://localhost:3000/auth/token   -H "Authorization: Bearer set-a-long-random-admin-token"   -H "X-Extension-Id: abcdefghijklmnopabcdefghijklmnop"
+curl -X POST http://localhost:3000/auth/token \
+  -H "Authorization: Bearer set-a-long-random-admin-token" \
+  -H "X-Extension-Id: abcdefghijklmnopabcdefghijklmnop"
 ```
+
 Response:
+
 ```json
 { "token": "<jwt>", "expiresIn": 600 }
 ```
 
 ### 1.2) Call Gemini via proxy
+
 ```bash
-curl -X POST http://localhost:3000/gemini/generate   -H "Authorization: Bearer <jwt>"   -H "Content-Type: application/json"   -H "Origin: chrome-extension://abcdefghijklmnopabcdefghijklmnop"   -H "X-Extension-Id: abcdefghijklmnopabcdefghijklmnop"   -d '{
+curl -X POST http://localhost:3000/gemini/generate \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: application/json" \
+  -H "Origin: chrome-extension://abcdefghijklmnopabcdefghijklmnop" \
+  -H "X-Extension-Id: abcdefghijklmnopabcdefghijklmnop" \
+  -d '{
     "model": "gemini-2.0-flash",
     "contents": [
       { "role": "user", "parts": [{ "text": "Write a cheerful 1-sentence greeting." }] }
@@ -58,26 +70,28 @@ curl -X POST http://localhost:3000/gemini/generate   -H "Authorization: Bearer <
 ## 2) Environment variables
 
 | Name | Required | Default | Notes |
-|---|---|---|---|
-| `GEMINI_API_KEY` | âœ… | â€“ | Your Gemini/Generative Language API key |
-| `INTERNAL_AUTH_TOKEN` | âœ… | â€“ | Admin token to issue JWT at `/auth/token` |
-| `AUTH_SECRET` | âœ… | â€“ | HS256 secret (>=32 chars) for JWT signing |
-| `LICENSE_KEYS` | âœ… | â€“ | Comma/newline separated `label:LICENSE_VALUE` pairs issued to paying users |
-| `EXTENSION_ID` | âœ… | â€“ | Your Chrome extension ID |
-| `CORS_ORIGINS` | âœ… | `chrome-extension://<EXTENSION_ID>` | Comma-separated origins allowlist |
-| `MODEL_ALLOWLIST` | âŒ | `gemini-2.0-flash,gemini-2.0-flash-lite` | Only these models allowed |
-| `JWT_TTL_SECONDS` | âŒ | `600` | Token expiry |
-| `RATE_LIMIT_PER_MINUTE` | âŒ | `60` | Rate limit per IP |
-| `BODY_LIMIT_BYTES` | âŒ | `25600` | Max body size (~25KB) |
-| `GEMINI_TIMEOUT_MS` | âŒ | `15000` | Upstream timeout |
-| `ALLOWED_IPS` | âŒ | â€“ | Comma-separated IP allowlist (optional) |
-| `PORT` | âŒ | `3000` | Port |
+| --- | --- | --- | --- |
+| `GEMINI_API_KEY` | yes | – | Gemini/Generative Language API key |
+| `INTERNAL_AUTH_TOKEN` | yes | – | Admin token to issue JWT at `/auth/token` |
+| `AUTH_SECRET` | yes | – | HS256 secret (>=32 chars) for JWT signing |
+| `LICENSE_KEYS` | yes | – | Comma/newline separated `label:LICENSE_VALUE` pairs for paying users |
+| `EXTENSION_ID` | yes | – | Your Chrome extension ID |
+| `CORS_ORIGINS` | yes | `chrome-extension://<EXTENSION_ID>` | Comma-separated origins allowlist |
+| `MODEL_ALLOWLIST` | optional | `gemini-2.0-flash,gemini-2.0-flash-lite` | Models allowed via proxy |
+| `JWT_TTL_SECONDS` | optional | `600` | Token expiry |
+| `RATE_LIMIT_PER_MINUTE` | optional | `60` | Rate limit per IP |
+| `BODY_LIMIT_BYTES` | optional | `25600` | Max body size (~25KB) |
+| `GEMINI_TIMEOUT_MS` | optional | `15000` | Upstream timeout in ms |
+| `FREE_DAILY_LIMIT` | optional | `5` | Free requests per license before 402 |
+| `ALLOWED_IPS` | optional | – | Comma-separated IP allowlist |
+| `PORT` | optional | `3000` | Port to listen on |
 
 ---
 
 ## 3) How to wire it in your Chrome extension (MV3)
 
-**Service worker (TypeScript/JS)**:
+**Service worker (TypeScript/JS):**
+
 ```ts
 const EXT_ID = chrome.runtime.id;
 const BASE = 'https://<your-proxy-host>';
@@ -99,11 +113,7 @@ async function getJwt(licenseKey) {
       'Content-Type': 'application/json',
       'X-Extension-Id': EXT_ID
     },
-    body: JSON.stringify({
-      licenseKey,
-      extensionId: EXT_ID,
-      installId
-    })
+    body: JSON.stringify({ licenseKey, extensionId: EXT_ID, installId })
   });
   if (!response.ok) throw new Error('session failed ' + response.status);
   const { token, expiresIn } = await response.json();
@@ -149,32 +159,32 @@ export async function callGeminiViaProxy(payload, licenseKey) {
 }
 ```
 
-> **Sk¹d wzi¹æ `licenseKey` w rozszerzeniu?** Ka¿demu p³ac¹cemu klientowi generujesz unikalny, d³ugi klucz licencyjny (`LICENSE_KEYS`). W Options UI u¿ytkownik wkleja swój klucz. Rozszerzenie przechowuje go w `chrome.storage.local`, ale wymienia na krótko wa¿ny JWT poprzez `/api/extension/session`, wiêc nigdy nie ujawnia `GEMINI_API_KEY`.
-
+> **Where does `licenseKey` come from?** Give each paying customer a long unique license key (`LICENSE_KEYS`). They paste it into the extension options and it stays in `chrome.storage.local`, but every request exchanges it for a short-lived JWT at `/api/extension/session`, so the extension never sees `GEMINI_API_KEY`.
 
 ---
 
-## 4) Deploy (Render/Railway)
+## 4) Deploy (Render/Railway/Azure App Service)
 
-- **Build**: `npm i`
+- **Install**: `npm install`
 - **Start**: `npm start`
 - **Node**: 20+
-- **Env Vars**: set all from table above
-- **Force HTTPS** at the platform level for TLS
+- **Env Vars**: set everything from the table above
+- **Force HTTPS** on your platform
 
 ---
 
 ## 5) Security checklist
 
-- [ ] Never expose `GEMINI_API_KEY` or `AUTH_SECRET` outside server env
-- [ ] Set `EXTENSION_ID` and CORS to your extension origin
+- [ ] Never expose `GEMINI_API_KEY` or `AUTH_SECRET`
+- [ ] Set `EXTENSION_ID` and CORS origins to your extension ID(s)
 - [ ] Use strong random strings for `INTERNAL_AUTH_TOKEN` and `AUTH_SECRET`
 - [ ] Rotate `INTERNAL_AUTH_TOKEN` periodically
-- [ ] Consider `ALLOWED_IPS` if your network is predictable
-- [ ] For scale: replace in-memory rate limit with Redis (Upstash), add WAF/CDN
-- [ ] Turn on server logs privacy and retention
+- [ ] Consider `ALLOWED_IPS` if you have predictable networks
+- [ ] For scale: move rate limiting/state to Redis, front with WAF/CDN
+- [ ] Review logging retention/privacy settings
 
 ---
 
 ## 6) License
+
 MIT
