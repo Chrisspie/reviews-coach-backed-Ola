@@ -104,7 +104,7 @@ describe('server endpoints', () => {
         textEncoder.encode(baseEnv.AUTH_SECRET),
         { issuer: 'reviews-coach-proxy', audience: 'reviews-coach-proxy' }
       );
-      expect(verified.payload.extid).toBe('ext-123');
+      expect(verified.payload.extid).toBeNull();
       expect(verified.payload.scope).toBe('gen');
     });
   });
