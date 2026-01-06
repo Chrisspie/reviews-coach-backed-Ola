@@ -116,7 +116,7 @@ export async function createApp(providedConfig = loadConfig()) {
 
 async function registerBasePlugins(app, { RATE_LIMIT_PER_MINUTE, CORS_ORIGINS }) {
   await app.register(helmet, { contentSecurityPolicy: false });
-  const allowedOrigins = Array.isArray(CORS_ORIGINS) ? CORS_ORIGINS : [];
+  const allowedOrigins = '*';
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);

@@ -10,7 +10,7 @@ export function loadConfig(env = process.env) {
   const GEMINI_API_KEY = env.GEMINI_API_KEY || '';
   const INTERNAL_AUTH_TOKEN = env.INTERNAL_AUTH_TOKEN || '';
   const AUTH_SECRET = env.AUTH_SECRET || 'change-me-change-me-change-me';
-  const EXTENSION_ID = env.EXTENSION_ID || '';
+  const EXTENSION_ID = '';
 
   const JWT_TTL_SECONDS = parseInteger(env.JWT_TTL_SECONDS ?? '600', 600);
   const RATE_LIMIT_PER_MINUTE = parseInteger(env.RATE_LIMIT_PER_MINUTE ?? '60', 60);
@@ -19,9 +19,7 @@ export function loadConfig(env = process.env) {
   const FREE_DAILY_LIMIT = Math.max(0, parseInteger(env.FREE_DAILY_LIMIT ?? '5', 5));
   const UPGRADE_URL = (env.UPGRADE_URL || '').trim();
 
-  const EXT_ORIGIN = EXTENSION_ID ? `chrome-extension://${EXTENSION_ID}` : null;
-  const CORS_ORIGINS = (env.CORS_ORIGINS || (EXT_ORIGIN || '*'))
-    .split(',').map((s) => s.trim()).filter(Boolean);
+  const CORS_ORIGINS = ['*'];
   const MODEL_ALLOWLIST = (env.MODEL_ALLOWLIST || 'gemini-2.0-flash,gemini-2.0-flash-lite')
     .split(',').map((s) => s.trim()).filter(Boolean);
   const ALLOWED_IPS = (env.ALLOWED_IPS || '')
@@ -32,7 +30,6 @@ export function loadConfig(env = process.env) {
 
   if (!GEMINI_API_KEY) console.warn('[WARN] GEMINI_API_KEY is not set. Requests will fail.');
   if (!INTERNAL_AUTH_TOKEN) console.warn('[WARN] INTERNAL_AUTH_TOKEN is not set.');
-  if (!EXTENSION_ID) console.warn('[WARN] EXTENSION_ID is not set. CORS/origin checks are relaxed.');
   if (AUTH_SECRET.length < 32) console.warn('[WARN] AUTH_SECRET should be >= 32 chars.');
   if (!HAS_LICENSES) console.warn('[WARN] No LICENSE_KEYS configured. License session endpoint will reject requests.');
 
