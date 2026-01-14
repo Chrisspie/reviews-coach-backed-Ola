@@ -1,13 +1,10 @@
-export function createExtensionRoutes({
+﻿export function createExtensionRoutes({
   HAS_LICENSES,
   verifyLicenseKey,
-  FREE_DAILY_LIMIT,
-  getUsageBucket,
-  quotaSnapshot,
+  licenseQuotaClient,
   signJwt,
   JWT_TTL_SECONDS,
   EXTENSION_ID,
-  UPGRADE_URL,
   unauthorized,
   badRequest,
   clientIp
@@ -47,8 +44,13 @@ export function createExtensionRoutes({
         : null;
       const nowMs = Date.now();
       const ttlSec = JWT_TTL_SECONDS;
-      const bucket = FREE_DAILY_LIMIT ? getUsageBucket(license.id) : null;
-      const quota = quotaSnapshot(bucket);
+      let quota = null;
+      try {
+        quota = await licenseQuotaClient.snapshot(license.id);
+      } catch (err) {
+        fastify.log.error({ msg: 'Failed to fetch license quota', err: String(err) });
+        return reply.code(503).send({ error: 'Usage service unavailable' });
+      }
       const token = await signJwt({ extid: resolvedExt, scope: 'gen', license: license.id, install: installTag }, ttlSec);
 
       return reply.send({
@@ -56,7 +58,7 @@ export function createExtensionRoutes({
         expiresIn: ttlSec,
         expiresAt: new Date(nowMs + ttlSec * 1000).toISOString(),
         license: { id: license.id },
-        quota: quota ? { ...quota, upgradeUrl: UPGRADE_URL } : null
+        quota: quota || null
       });
     });
   };

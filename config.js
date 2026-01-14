@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+﻿import { createHash } from 'node:crypto';
 
 function parseInteger(value, fallback) {
   const parsed = parseInt(value, 10);
@@ -16,9 +16,6 @@ export function loadConfig(env = process.env) {
   const RATE_LIMIT_PER_MINUTE = parseInteger(env.RATE_LIMIT_PER_MINUTE ?? '60', 60);
   const BODY_LIMIT_BYTES = parseInteger(env.BODY_LIMIT_BYTES ?? String(25 * 1024), 25 * 1024);
   const GEMINI_TIMEOUT_MS = parseInteger(env.GEMINI_TIMEOUT_MS ?? '15000', 15000);
-  const FREE_DAILY_LIMIT = Math.max(0, parseInteger(env.FREE_DAILY_LIMIT ?? '5', 5));
-  const UPGRADE_URL = (env.UPGRADE_URL || '').trim();
-
   const CORS_ORIGINS = ['*'];
   const MODEL_ALLOWLIST = (env.MODEL_ALLOWLIST || 'gemini-2.0-flash,gemini-2.0-flash-lite')
     .split(',').map((s) => s.trim()).filter(Boolean);
@@ -33,6 +30,8 @@ export function loadConfig(env = process.env) {
   if (AUTH_SECRET.length < 32) console.warn('[WARN] AUTH_SECRET should be >= 32 chars.');
   if (!HAS_LICENSES) console.warn('[WARN] No LICENSE_KEYS configured. License session endpoint will reject requests.');
 
+  const USAGE_SERVICE_BASE_URL = (env.USAGE_SERVICE_BASE_URL || env.BACKEND_USAGE_BASE_URL || '').trim().replace(/\\/\$/,'');
+
   return {
     PORT,
     GEMINI_API_KEY,
@@ -43,9 +42,8 @@ export function loadConfig(env = process.env) {
     RATE_LIMIT_PER_MINUTE,
     BODY_LIMIT_BYTES,
     GEMINI_TIMEOUT_MS,
-    FREE_DAILY_LIMIT,
-    UPGRADE_URL,
     CORS_ORIGINS,
+    USAGE_SERVICE_BASE_URL,
     MODEL_ALLOWLIST,
     ALLOWED_IPS,
     LICENSE_RECORDS,

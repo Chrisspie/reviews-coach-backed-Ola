@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+﻿import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { jwtVerify } from 'jose';
+
+const USAGE_BASE_URL = 'https://usage.example.com';
+const DEFAULT_UPGRADE_URL = 'https://upgrade.example.com';
 
 const baseEnv = {
   NODE_ENV: 'test',
@@ -9,23 +12,93 @@ const baseEnv = {
   AUTH_SECRET: 'change-me-change-me-change-me-secret-123',
   EXTENSION_ID: 'ext-123',
   LICENSE_KEYS: 'pro:LICENSE-KEY',
-  FREE_DAILY_LIMIT: '2',
-  UPGRADE_URL: 'https://upgrade.example.com',
+  USAGE_SERVICE_BASE_URL: USAGE_BASE_URL,
   MODEL_ALLOWLIST: 'gemini-test-model',
   CORS_ORIGINS: '*'
 };
 
 const textEncoder = new TextEncoder();
 const originalFetch = globalThis.fetch;
+let fetchMock;
+let usageState;
+
+beforeEach(() => {
+  installFetchMock();
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
+  usageState = null;
   if (originalFetch) {
     globalThis.fetch = originalFetch;
   } else {
     delete globalThis.fetch;
   }
 });
+
+function installFetchMock(options = {}) {
+  const { usageLimit = 2, remaining = usageLimit, geminiResponse = buildGeminiResponse() } = options;
+  usageState = { limit: usageLimit, remaining };
+  fetchMock = vi.fn(async (url, init = {}) => {
+    if (typeof url === 'string' && url.startsWith(USAGE_BASE_URL)) {
+      return handleUsageRequest(url);
+    }
+    return typeof geminiResponse === 'function' ? geminiResponse() : geminiResponse;
+  });
+  globalThis.fetch = fetchMock;
+}
+
+function handleUsageRequest(rawUrl) {
+  const { pathname } = new URL(rawUrl);
+  if (pathname.endsWith('/quota')) {
+    return buildJsonResponse(200, { quota: currentQuota() });
+  }
+  if (pathname.endsWith('/quota/consume')) {
+    if (usageState.remaining <= 0) {
+      return buildJsonResponse(200, { allowed: false, quota: currentQuota() });
+    }
+    usageState.remaining -= 1;
+    return buildJsonResponse(200, { allowed: true, quota: currentQuota() });
+  }
+  if (pathname.endsWith('/quota/refund')) {
+    usageState.remaining = Math.min(usageState.limit, usageState.remaining + 1);
+    return buildJsonResponse(204, {});
+  }
+  throw new Error(Unexpected usage service path: );
+}
+
+function currentQuota() {
+  return {
+    limit: usageState.limit,
+    remaining: usageState.remaining,
+    upgradeUrl: DEFAULT_UPGRADE_URL
+  };
+}
+
+function buildJsonResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async text() {
+      return JSON.stringify(body);
+    },
+    async json() {
+      return body;
+    }
+  };
+}
+
+function buildGeminiResponse(body) {
+  const payload = body || {
+    content: [],
+    usageMetadata: {
+      totalTokenCount: 10,
+      promptTokenCount: 4,
+      candidatesTokenCount: 6
+    }
+  };
+  return buildJsonResponse(200, payload);
+}
 
 function applyEnv(overrides = {}) {
   const keys = new Set([...Object.keys(baseEnv), ...Object.keys(overrides)]);
@@ -144,6 +217,7 @@ describe('server endpoints', () => {
       });
       expect(ok.statusCode).toBe(200);
       expect(ok.json().license.id).toBe('pro');
+      expect(ok.json().quota.limit).toBe(2);
     });
   });
 
@@ -163,7 +237,7 @@ describe('server endpoints', () => {
       const ok = await app.inject({
         method: 'POST',
         url: '/api/extension/log',
-        headers: { authorization: `Bearer ${token}` },
+        headers: { authorization: Bearer  },
         payload: { level: 'warn', message: 'hello' }
       });
       expect(ok.statusCode).toBe(200);
@@ -172,19 +246,7 @@ describe('server endpoints', () => {
   });
 
   it('proxies Gemini requests and forwards usage headers', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      text: async () => JSON.stringify({
-        content: [],
-        usageMetadata: {
-          totalTokenCount: 10,
-          promptTokenCount: 4,
-          candidatesTokenCount: 6
-        }
-      })
-    });
-    globalThis.fetch = fetchMock;
-
+    installFetchMock({ geminiResponse: buildGeminiResponse() });
     await withServer({}, async (app) => {
       const session = await app.inject({
         method: 'POST',
@@ -197,7 +259,7 @@ describe('server endpoints', () => {
       const proxy = await app.inject({
         method: 'POST',
         url: '/gemini/generate',
-        headers: { authorization: `Bearer ${token}` },
+        headers: { authorization: Bearer  },
         payload: {
           model: 'gemini-test-model',
           contents: [{ role: 'user', parts: [{ text: 'hello' }] }]
@@ -207,18 +269,13 @@ describe('server endpoints', () => {
       expect(proxy.statusCode).toBe(200);
       expect(proxy.headers['x-free-remaining']).toBe('1');
       expect(proxy.headers['x-token-usage-total']).toBe('10');
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
     });
   });
 
   it('limits Gemini proxy requests once the free quota is reached', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      text: async () => JSON.stringify({ content: [] })
-    });
-    globalThis.fetch = fetchMock;
-
-    await withServer({ FREE_DAILY_LIMIT: '1' }, async (app) => {
+    installFetchMock({ usageLimit: 1, remaining: 1, geminiResponse: buildGeminiResponse({ content: [] }) });
+    await withServer({}, async (app) => {
       const session = await app.inject({
         method: 'POST',
         url: '/api/extension/session',
@@ -230,7 +287,7 @@ describe('server endpoints', () => {
       const first = await app.inject({
         method: 'POST',
         url: '/gemini/generate',
-        headers: { authorization: `Bearer ${token}` },
+        headers: { authorization: Bearer  },
         payload: {
           model: 'gemini-test-model',
           contents: [{ role: 'user', parts: [{ text: 'hello' }] }]
@@ -241,7 +298,7 @@ describe('server endpoints', () => {
       const second = await app.inject({
         method: 'POST',
         url: '/gemini/generate',
-        headers: { authorization: `Bearer ${token}` },
+        headers: { authorization: Bearer  },
         payload: {
           model: 'gemini-test-model',
           contents: [{ role: 'user', parts: [{ text: 'hello again' }] }]

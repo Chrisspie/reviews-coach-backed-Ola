@@ -82,7 +82,7 @@ curl -X POST http://localhost:3000/gemini/generate \
 | `RATE_LIMIT_PER_MINUTE` | optional | `60` | Rate limit per IP |
 | `BODY_LIMIT_BYTES` | optional | `25600` | Max body size (~25KB) |
 | `GEMINI_TIMEOUT_MS` | optional | `15000` | Upstream timeout in ms |
-| `FREE_DAILY_LIMIT` | optional | `5` | Free requests per license before 402 |
+| `USAGE_SERVICE_BASE_URL` | yes | - | Base URL for the backend usage/quota API |
 | `ALLOWED_IPS` | optional | – | Comma-separated IP allowlist |
 | `PORT` | optional | `3000` | Port to listen on |
 

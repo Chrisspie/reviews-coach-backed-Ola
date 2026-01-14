@@ -1,4 +1,4 @@
-import Fastify from 'fastify';
+﻿import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
@@ -14,7 +14,7 @@ import { createExtensionRoutes } from '../routes/extension.js';
 import { createLogRoutes } from '../routes/log.js';
 import { createProxyRoutes } from '../routes/proxy.js';
 
-import { createUsageService } from './services/usage-service.js';
+import { createLicenseQuotaClient } from './services/license-quota-client.js';
 import { createJwtService } from './services/jwt-service.js';
 
 export async function createApp(providedConfig = loadConfig()) {
@@ -28,9 +28,8 @@ export async function createApp(providedConfig = loadConfig()) {
     RATE_LIMIT_PER_MINUTE,
     BODY_LIMIT_BYTES,
     GEMINI_TIMEOUT_MS,
-    FREE_DAILY_LIMIT,
-    UPGRADE_URL,
     CORS_ORIGINS,
+    USAGE_SERVICE_BASE_URL,
     MODEL_ALLOWLIST,
     ALLOWED_IPS,
     LICENSE_RECORDS,
@@ -46,8 +45,12 @@ export async function createApp(providedConfig = loadConfig()) {
   await registerBasePlugins(app, { RATE_LIMIT_PER_MINUTE, CORS_ORIGINS });
 
   const verifyLicenseKey = createLicenseVerifier(LICENSE_RECORDS, HAS_LICENSES);
-  const usageService = createUsageService({ FREE_DAILY_LIMIT });
-  const { getUsageBucket, quotaSnapshot } = usageService;
+  const licenseQuotaClient = createLicenseQuotaClient({
+    usageBaseUrl: USAGE_SERVICE_BASE_URL,
+    internalAuthToken: INTERNAL_AUTH_TOKEN,
+    fetchImpl: fetch,
+    logger: app.log
+  });
 
   const { signJwt, verifyJwt } = createJwtService({
     authSecret: AUTH_SECRET,
@@ -76,13 +79,11 @@ export async function createApp(providedConfig = loadConfig()) {
   await app.register(createExtensionRoutes({
     HAS_LICENSES,
     verifyLicenseKey,
-    FREE_DAILY_LIMIT,
-    getUsageBucket,
-    quotaSnapshot,
+    licenseQuotaClient,
     signJwt,
     JWT_TTL_SECONDS,
     EXTENSION_ID,
-    UPGRADE_URL,
+
     unauthorized,
     badRequest,
     clientIp
@@ -100,10 +101,7 @@ export async function createApp(providedConfig = loadConfig()) {
     unauthorized,
     badRequest,
     forbidden,
-    getUsageBucket,
-    FREE_DAILY_LIMIT,
-    quotaSnapshot,
-    UPGRADE_URL,
+    licenseQuotaClient,
     GEMINI_TIMEOUT_MS,
     usageFrom,
     setUsageHeaders,

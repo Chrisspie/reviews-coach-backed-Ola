@@ -1,14 +1,11 @@
-export function createProxyRoutes({
+﻿export function createProxyRoutes({
   GEMINI_API_KEY,
   EXTENSION_ID,
   verifyJwt,
   unauthorized,
   badRequest,
   forbidden,
-  getUsageBucket,
-  FREE_DAILY_LIMIT,
-  quotaSnapshot,
-  UPGRADE_URL,
+  licenseQuotaClient,
   GEMINI_TIMEOUT_MS,
   usageFrom,
   setUsageHeaders,
@@ -45,44 +42,28 @@ export function createProxyRoutes({
         return forbidden(reply, 'Model not allowed');
       }
 
-      const licenseId = tokenPayload?.user || tokenPayload?.license || 'dev-user';
-      const bucket = FREE_DAILY_LIMIT ? getUsageBucket(licenseId) : null;
-      const rejectQuotaResponse = ({
-        message,
-        remaining = 0,
-        limit = FREE_DAILY_LIMIT,
-        upgradeUrl = UPGRADE_URL
-      }) => {
-        const normalizedLimit = Number.isFinite(limit) ? Math.max(0, limit) : 0;
-        const normalizedRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : 0;
-        reply.header('X-Free-Limit', String(normalizedLimit));
-        reply.header('X-Free-Remaining', String(normalizedRemaining));
-        return reply.code(402).send({
-          error: message,
-          code: 'FREE_LIMIT_REACHED',
-          limit: normalizedLimit,
-          remaining: normalizedRemaining,
-          upgradeUrl
-        });
-      };
-      if (bucket && FREE_DAILY_LIMIT && bucket.count >= FREE_DAILY_LIMIT) {
-        return rejectQuotaResponse({ message: 'Limit darmowych odpowiedzi został wykorzystany.', remaining: 0 });
+      const licenseId = tokenPayload?.license ? String(tokenPayload.license) : null;
+      let reservedLicenseUsage = false;
+      if (licenseId) {
+        try {
+          const decision = await licenseQuotaClient.consume(licenseId);
+          if (!decision.allowed) {
+            applyQuotaHeaders(reply, decision.quota);
+            return reply.code(402).send(limitReachedPayload(decision.quota));
+          }
+          reservedLicenseUsage = true;
+          applyQuotaHeaders(reply, decision.quota);
+        } catch (err) {
+          fastify.log.error({ msg: 'Usage service consume failed', err: String(err) });
+          return reply.code(503).send({ error: 'Usage service unavailable' });
+        }
       }
-
-      const stampQuotaHeaders = (remainingOverride) => {
-        if (!FREE_DAILY_LIMIT || !bucket) return;
-        const remaining = (typeof remainingOverride === 'number')
-          ? Math.max(0, remainingOverride)
-          : Math.max(0, FREE_DAILY_LIMIT - bucket.count);
-        reply.header('X-Free-Limit', String(FREE_DAILY_LIMIT));
-        reply.header('X-Free-Remaining', String(remaining));
-      };
 
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
 
       try {
-        const url = `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        const url = https://generativelanguage.googleapis.com/v1/models/:generateContent?key=;
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -94,46 +75,86 @@ export function createProxyRoutes({
         let parsed; try { parsed = JSON.parse(textBody); } catch { parsed = null; }
 
         if (res.ok) {
-          if (bucket && FREE_DAILY_LIMIT) {
-            bucket.count += 1;
-            const remaining = Math.max(0, FREE_DAILY_LIMIT - bucket.count);
-            stampQuotaHeaders(remaining);
-            const freeMessage = remaining > 0
-              ? `Remaining ${remaining} of ${FREE_DAILY_LIMIT} free responses.`
-              : 'Free response limit reached.';
-            reply.header('X-Free-Message', freeMessage);
-          }
+          reservedLicenseUsage = false;
           const usage = usageFrom(parsed);
           if (usage) setUsageHeaders(reply, usage);
           return reply.code(200).type('application/json').send(parsed ?? textBody);
-        } else {
-          if (res.status === 429) {
-            const quotaPayload = quotaSnapshot(bucket) || { limit: FREE_DAILY_LIMIT || 0, remaining: 0, upgradeUrl: UPGRADE_URL };
-            return rejectQuotaResponse({
-              message: 'Limit darmowych odpowiedzi został wykorzystany.',
-              limit: quotaPayload.limit ?? FREE_DAILY_LIMIT ?? 0,
-              remaining: quotaPayload.remaining ?? 0,
-              upgradeUrl: quotaPayload.upgradeUrl ?? UPGRADE_URL
-            });
-          }
-          stampQuotaHeaders();
-          fastify.log.error({
-            msg: 'Upstream Gemini error',
-            status: res.status,
-            statusText: res.statusText,
-            bodyPreview: String(textBody).slice(0, 200),
-            promptPreview: maskContents(contents)
-          });
-          return reply.code(res.status).send({ error: (parsed && parsed.error && parsed.error.message) || `Upstream error ${res.status}` });
         }
+
+        if (res.status === 429) {
+          if (reservedLicenseUsage && licenseId) {
+            await licenseQuotaClient.refund(licenseId);
+            reservedLicenseUsage = false;
+          }
+          let quota = null;
+          if (licenseId) {
+            try {
+              quota = await licenseQuotaClient.snapshot(licenseId);
+            } catch (err) {
+              fastify.log.warn({ msg: 'Usage service snapshot failed', err: String(err) });
+            }
+          }
+          applyQuotaHeaders(reply, quota);
+          return reply.code(402).send(limitReachedPayload(quota));
+        }
+
+        if (reservedLicenseUsage && licenseId) {
+          await licenseQuotaClient.refund(licenseId);
+          reservedLicenseUsage = false;
+        }
+
+        fastify.log.error({
+          msg: 'Upstream Gemini error',
+          status: res.status,
+          statusText: res.statusText,
+          bodyPreview: String(textBody).slice(0, 200),
+          promptPreview: maskContents(contents)
+        });
+        return reply.code(res.status).send({ error: (parsed && parsed.error && parsed.error.message) || Upstream error  });
       } catch (err) {
         const isTimeout = err?.name === 'AbortError';
         fastify.log.error({ msg: 'Request to Gemini failed', error: String(err), promptPreview: maskContents(contents) });
-        stampQuotaHeaders();
+        if (reservedLicenseUsage && licenseId) {
+          await licenseQuotaClient.refund(licenseId);
+        }
         return reply.code(isTimeout ? 504 : 502).send({ error: isTimeout ? 'Upstream timeout' : 'Upstream failure' });
       } finally {
         clearTimeout(timeout);
       }
     });
   };
+}
+
+function limitReachedPayload(quota) {
+  const normalizedLimit = typeof quota?.limit === 'number' ? Math.max(0, quota.limit) : 0;
+  const normalizedRemaining = typeof quota?.remaining === 'number' ? Math.max(0, quota.remaining) : 0;
+  return {
+    error: 'Limit darmowych odpowiedzi został wykorzystany.',
+    code: 'FREE_LIMIT_REACHED',
+    limit: normalizedLimit,
+    remaining: normalizedRemaining,
+    upgradeUrl: quota?.upgradeUrl || null,
+    quota: quota || null
+  };
+}
+
+function applyQuotaHeaders(reply, quota) {
+  if (!quota) return;
+  const limit = typeof quota.limit === 'number' ? Math.max(0, quota.limit) : null;
+  const remaining = typeof quota.remaining === 'number' ? Math.max(0, quota.remaining) : null;
+  if (limit !== null) {
+    reply.header('X-Free-Limit', String(limit));
+  }
+  if (remaining !== null) {
+    reply.header('X-Free-Remaining', String(remaining));
+    if (limit !== null) {
+      const message = remaining > 0
+        ? Remaining  of  free responses.
+        : 'Free response limit reached.';
+      reply.header('X-Free-Message', message);
+    }
+  }
+  if (quota.upgradeUrl) {
+    reply.header('X-Free-Upgrade-Url', quota.upgradeUrl);
+  }
 }
